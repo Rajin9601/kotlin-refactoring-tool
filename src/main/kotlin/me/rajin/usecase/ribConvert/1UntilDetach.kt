@@ -177,13 +177,27 @@ fun processInteractorFile(file: File) {
     classAST.body!!.addAfter(propDecl, beforeDecl)
     classAST.body!!.addAfter(factory.createWhiteSpace("\n"), beforeDecl)
 
-    ast = parseKtFile(ast.text.replace(Regex("super\\.didBecomeActive\\(.*\\)"), "$0\nviewBinder.bind(this)"))
-    factory = KtPsiFactory(ast)
+    if (classAST.declarations.filterIsInstance<KtNamedFunction>().any { it.name == "didBecomeActive" }) {
+        ast = parseKtFile(ast.text.replace(Regex("super\\.didBecomeActive\\(.*\\)"), "$0\nviewBinder.bind(this)"))
+        factory = KtPsiFactory(ast)
+    } else {
+        val func = factory.createFunction("""
+            override fun didBecomeActive(savedInstanceState: Bundle?) {
+                super.didBecomeActive(savedInstanceState)
+                viewBinder.bind(this)
+            }
+            
+        """.trimIndent())
+        classAST.addDeclarationBefore(func, classAST.declarations.filterIsInstance<KtNamedFunction>().first())
+    }
+
 
     fun createImport(pckage: String) {
         createImport(ast, factory, pckage)
     }
     createImport("kr.co.vcnc.tada.rider.RiderRibViewBinder")
+    createImport("com.uber.rib2.core.Bundle")
+
     file.writeText(ast.text)
 }
 
