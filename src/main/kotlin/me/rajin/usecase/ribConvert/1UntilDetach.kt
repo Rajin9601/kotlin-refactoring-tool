@@ -1,11 +1,14 @@
 package me.rajin.usecase.ribConvert
+
 import me.rajin.parse.parseKtFile
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClass
+import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.jetbrains.kotlin.psi.addRemoveModifier.setModifierList
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.findDescendantOfType
 import org.jetbrains.kotlin.psi.psiUtil.referenceExpression
@@ -16,17 +19,35 @@ import java.nio.file.Paths
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.name
+import kotlin.streams.toList
 
 fun main(args: Array<String>) {
+    val filePaths = Files.walk(Paths.get("/Users/david/vcnc/tada-android/tada-rider/src/main/java/kr/co/vcnc/tada/rider"))
+        .filter { it.name.endsWith("Builder.kt") }
+        .filter { it.isRegularFile() && it.isDirectory().not() }
+        .filter { filterViewBuilder(it.toFile()) }
+        .toList()
+
+    filePaths.forEach {
+        processBuilderFile(it.toFile())
+    }
+
     Files.walk(Paths.get("/Users/david/vcnc/tada-android/tada-rider/src/main/java/kr/co/vcnc/tada/rider"))
         .filter { it.name.endsWith("View.kt") }
         .filter { it.isRegularFile() && it.isDirectory().not() }
         .forEach {
-            processFile(it.toFile())
+            processViewFile(it.toFile())
+        }
+
+    filePaths.map {
+        it.parent.resolve(it.name.replace("Builder.kt", "Interactor.kt"))
+    }
+        .forEach {
+            processInteractorFile(it.toFile())
         }
 }
 
-fun processFile(file: File) {
+fun processViewFile(file: File) {
     // 원하는 것 : untilDetach(this) -> autoDispose(scope)
     // scope 는 해당 함수의 인자로 넣는다.
     // 이렇게 했을때 결국 bindView 에서 시작되어야 함.
@@ -87,8 +108,7 @@ fun processFile(file: File) {
     // import 문 넣기
     val factory = KtPsiFactory(ast.importList!!)
     fun createImport(pckage: String) {
-        ast.importList?.add(factory.createWhiteSpace("\n"))
-        ast.importList?.add(factory.createImportDirective(ImportPath(FqName(pckage), isAllUnder = false)))
+        createImport(ast, factory, pckage)
     }
     createImport("autodispose2.ScopeProvider")
     createImport("autodispose2.autoDispose")
@@ -98,6 +118,78 @@ fun processFile(file: File) {
     // 2: scopeAddFunction 리스트가 우리가 원하는 리스트가 맞는가
 
     file.writeText(ast.text)
+}
+
+fun filterViewBuilder(file: File): Boolean {
+    val ast = parseKtFile(file)
+    return ast.declarations.filterIsInstance<KtClass>().any {
+        it.superTypeListEntries.any { it.text.startsWith("ViewBuilder") }
+    }
+}
+
+fun processBuilderFile(file: File) {
+    // 원하는 것 : class Module 에 맨 밑에 binds 문 넣기
+    println("process start: ${file.path}")
+    val ast = parseKtFile(file)
+    val classAST = ast.declarations.filterIsInstance<KtClass>().filter {
+        it.superTypeListEntries.any { it.text.startsWith("ViewBuilder") }
+    }.firstOrNull() ?: return
+    val ribName = classAST.name!!.removeSuffix("Builder")
+
+    val module = classAST.declarations.filterIsInstance<KtClass>().filter {
+        it.name == "Module"
+    }.firstOrNull() ?: throw RuntimeException("No Module class in ViewBuilder")
+
+    val factory = KtPsiFactory(module)
+
+    val funcDeclaration = factory.createFunction("fun ribViewBinder(view: ${ribName}View): RiderRibViewBinder")
+    funcDeclaration.setModifierList(factory.createModifierList("@Binds abstract"))
+    module.addDeclaration(funcDeclaration)
+
+    fun createImport(pckage: String) {
+        createImport(ast, factory, pckage)
+    }
+    createImport("kr.co.vcnc.tada.rider.RiderRibViewBinder")
+    createImport("dagger.Binds")
+    file.writeText(ast.text)
+}
+
+fun processInteractorFile(file: File) {
+    // 원하는 것 : viewBinder inject 하고 didBecomeActive 에서 super.didBecomeActive 후에 bind 해주기
+
+    println("process start: ${file.path}")
+    var ast = parseKtFile(file)
+    val classAST = ast.declarations.filterIsInstance<KtClass>().filter {
+        it.superTypeListEntries.any { it.text.startsWith("TadaRibInteractor") }
+    }.firstOrNull() ?: return
+    val ribName = classAST.name!!.removeSuffix("Builder")
+
+    var factory = KtPsiFactory(classAST)
+
+    val beforeDecl = classAST.getProperties().filter { it.name == "initParams" }.lastOrNull()
+        ?: classAST.getProperties().filter {
+            it.isMember && it.modifierList?.annotationEntries?.any { it.text == "@Inject" } == true
+        }.lastOrNull()
+        ?: throw RuntimeException("has no Inject fields")
+
+    val propDecl = factory.createProperty("@Inject lateinit var viewBinder: RiderRibViewBinder")
+
+    classAST.body!!.addAfter(propDecl, beforeDecl)
+    classAST.body!!.addAfter(factory.createWhiteSpace("\n"), beforeDecl)
+
+    ast = parseKtFile(ast.text.replace(Regex("super\\.didBecomeActive\\(.*\\)"), "$0\nviewBinder.bind(this)"))
+    factory = KtPsiFactory(ast)
+
+    fun createImport(pckage: String) {
+        createImport(ast, factory, pckage)
+    }
+    createImport("kr.co.vcnc.tada.rider.RiderRibViewBinder")
+    file.writeText(ast.text)
+}
+
+fun createImport(ast: KtFile, factory: KtPsiFactory, pckage: String) {
+    ast.importList?.add(factory.createWhiteSpace("\n"))
+    ast.importList?.add(factory.createImportDirective(ImportPath(FqName(pckage), isAllUnder = false)))
 }
 
 val knownScopeFunctions = setOf("bindView", "bindUI", "bindActions", "bindAction")
